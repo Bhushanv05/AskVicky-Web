@@ -172,13 +172,28 @@ def chat_markdown():
 
 
 # ── MODEL CALL ────────────────────────────────────────────────────────────────
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+
+def system_prompt():
+    """Base prompt plus the real current date/time. The model has no clock and
+    gets the weekday wrong when left to work it out, so we state it outright."""
+    now = dt.datetime.now(IST)
+    return (
+        SYSTEM_PROMPT
+        + f"\n\nCurrent date and time: {now.strftime('%A')}, {now.day} {now.strftime('%B %Y')}, "
+        + f"{now.strftime('%I:%M %p')} IST. Use this for any question about today's date, "
+        + "the day of the week, or the time."
+    )
+
+
 def generate_reply(api_key):
     """Stream the reply into the current chat bubble and return the full text."""
     history = [{"role": m["role"], "content": m["content"]} for m in ss.messages[-HISTORY_WINDOW:]]
     try:
         stream = get_client(api_key).chat.completions.create(
             model=MODEL,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
+            messages=[{"role": "system", "content": system_prompt()}] + history,
             # gpt-oss is a reasoning model: reasoning tokens count against this limit,
             # so it must be well above the length of the visible answer.
             max_tokens=4096,
