@@ -2,6 +2,8 @@
 
 Browser version of the AskVicky Android app. Same system prompt, same quick prompts, built with Streamlit and Groq.
 
+🌐 **Live app: https://askvicky-ai.streamlit.app/**
+
 ## Run locally
 
 ```
