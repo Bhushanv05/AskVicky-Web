@@ -1,5 +1,7 @@
 import os
+import re
 import threading
+import time
 import datetime as dt
 
 import streamlit as st
@@ -33,7 +35,8 @@ MAX_FILES_PER_SESSION = 10     # attachments are token-heavy, so capped separate
 ATTACH_SLOT_COST = 3           # a message with files uses 3 of the daily slots
 MAX_IMAGES_PER_SESSION = 5     # images are the most token-heavy attachment
 IMAGE_SLOT_COST = 10           # a message with images uses 10 of the daily slots
-VISION_MAX_TOKENS = 3000       # kept below the text limit: the vision model's per-minute budget is small
+VISION_MAX_TOKENS = 2000       # kept below the text limit: the vision model's per-minute budget is small
+MAX_AUTO_WAIT = 30             # seconds: wait this long and retry once if Groq says it will clear soon
 
 SYSTEM_PROMPT = """You are AskVicky — a highly capable, friendly AI assistant for everyone — professionals, students, and anyone who needs help. You can help with absolutely any topic:
 
@@ -88,6 +91,44 @@ def take_global_slot(cost=1):
         return True
 
 
+def rate_limit_info(exc):
+    """Read which Groq limit was hit and how long to wait, from a 429 error.
+
+    Returns {"scope": "minute" | "day" | None, "wait": seconds or None}. Only these two
+    facts are used; the raw error text (it contains account ids) is never shown.
+    """
+    text = (getattr(exc, "message", "") or str(exc)).lower()
+    scope = None
+    if "per day" in text or "(tpd)" in text or "(rpd)" in text:
+        scope = "day"
+    elif "per minute" in text or "(tpm)" in text or "(rpm)" in text:
+        scope = "minute"
+    wait = None
+    m = re.search(r"try again in\s+((?:[0-9.]+(?:ms|h|m|s))+)", text)
+    if m:
+        unit = {"h": 3600, "m": 60, "s": 1, "ms": 0.001}
+        try:
+            wait = sum(float(n) * unit[u] for n, u in re.findall(r"([0-9.]+)(ms|h|m|s)", m.group(1)))
+        except ValueError:
+            wait = None
+    if wait is None:
+        try:
+            wait = float(exc.response.headers.get("retry-after"))
+        except Exception:
+            wait = None
+    return {"scope": scope, "wait": wait}
+
+
+def _fmt_wait(seconds):
+    if seconds is None:
+        return None
+    if seconds < 90:
+        return f"about {max(1, round(seconds))} seconds"
+    if seconds < 5400:
+        return f"about {round(seconds / 60)} minutes"
+    return f"about {round(seconds / 3600, 1):g} hours"
+
+
 def friendly_error(exc, vision=False):
     """Turn an API exception into a message that is useful and never leaks the key."""
     status = getattr(exc, "status_code", None)
@@ -104,6 +145,16 @@ def friendly_error(exc, vision=False):
         return ("⚠️ That message (with its attachment) is too large for the free AI tier. "
                 "Try a smaller file, fewer pages or fewer images.")
     if status == 429 or name == "RateLimitError":
+        info = rate_limit_info(exc)
+        wait = _fmt_wait(info["wait"])
+        if info["scope"] == "day":
+            return ("⚠️ The free AI quota for today is used up"
+                    + (f" and resets in {wait}" if wait else "")
+                    + ". Text questions use far less quota than images, so try again without an image, "
+                      "or come back later.")
+        if info["scope"] == "minute":
+            return ("⚠️ Too many requests in a short time for the free AI tier. "
+                    f"Please wait {wait or 'a minute'} and try again.")
         return "⚠️ The free AI quota is used up for now. Please try again in a few minutes."
     if name in ("APIConnectionError", "APITimeoutError"):
         return "⚠️ Could not reach the AI service. Please try again."
@@ -244,6 +295,29 @@ def build_history():
     return out, vision
 
 
+def create_with_retry(client, kwargs, vision):
+    """Start the model call. Two known hiccups are handled quietly:
+    - the vision model rejects the no-reasoning option (400): retry without it;
+    - Groq's per-minute budget is full (429) and will clear within MAX_AUTO_WAIT seconds:
+      wait for it and retry. A daily limit is never waited out.
+    """
+    for attempt in range(3):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            if vision and status == 400 and "extra_body" in kwargs:
+                kwargs.pop("extra_body")
+                continue
+            if status == 429 or type(exc).__name__ == "RateLimitError":
+                info = rate_limit_info(exc)
+                if (attempt < 2 and info["scope"] != "day" and info["wait"] is not None
+                        and info["wait"] <= MAX_AUTO_WAIT):
+                    time.sleep(info["wait"] + 1)
+                    continue
+            raise
+
+
 def generate_reply(api_key):
     """Stream the reply into the current chat bubble and return the full text."""
     history, vision = build_history()
@@ -262,14 +336,7 @@ def generate_reply(api_key):
         kwargs["extra_body"] = {"reasoning_effort": "none"}
     client = get_client(api_key)
     try:
-        try:
-            stream = client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            if vision and getattr(exc, "status_code", None) == 400:
-                kwargs.pop("extra_body", None)      # model may not accept that option
-                stream = client.chat.completions.create(**kwargs)
-            else:
-                raise
+        stream = create_with_retry(client, kwargs, vision)
     except Exception as exc:
         return friendly_error(exc, vision)
 
