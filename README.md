@@ -24,9 +24,11 @@ streamlit run app.py
 - 40 messages per browser session
 - 500 messages per day across all visitors (edit `GLOBAL_DAILY_CAP` in `app.py`)
 - Recent chats live only in the current browser session; use "Download this chat" to keep one
-- Attachments: PDF, Word, Excel, CSV or text files; up to 3 per message, 5 MB each, 10 per session. A message with files counts as 3 against the daily cap. Images and scanned PDFs are not supported (the model reads text only).
+- Attachments: PDF, Word, Excel, CSV or text files, plus screenshots/photos (PNG, JPG, WEBP); up to 3 per message, 5 MB each, 10 files and 5 images per session. A message with files counts as 3 against the daily cap, one with images as 10. Scanned PDFs are not read (attach a screenshot of the page instead).
 - Attached text is sent to Groq's AI service, so do not upload customer data or confidential bank documents.
 
 ## Changing the model
 
-Set `GROQ_TEXT_MODEL` in Secrets. No code change needed when Groq retires a model.
+Set `GROQ_TEXT_MODEL` (text, default `openai/gpt-oss-120b`) and `GROQ_VISION_MODEL` (images, default `qwen/qwen3.8-27b`) in Secrets. No code change needed when Groq renames or retires a model.
+
+Images are resized to 1600 px and re-encoded as JPEG before sending, which also removes hidden metadata such as GPS location.
