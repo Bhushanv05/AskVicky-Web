@@ -23,7 +23,7 @@ streamlit run app.py
 
 - 40 messages per browser session
 - 500 messages per day across all visitors (edit `GLOBAL_DAILY_CAP` in `app.py`)
-- Recent chats live only in the current browser session; use "Download this chat" to keep one
+- Recent chats (last 20, text only) are saved in this browser's local storage, so they survive closing the app. They stay on your device only: nothing is stored on a server, other browsers/devices do not see them, and clearing site data or "Clear all" removes them. Attached files and images are not saved. Use "Download this chat" to keep one permanently.
 - Attachments: PDF, Word, Excel, CSV or text files, plus screenshots/photos (PNG, JPG, WEBP); up to 3 per message, 5 MB each, 10 files and 5 images per session. A message with files counts as 3 against the daily cap, one with images as 10. Scanned PDFs are not read (attach a screenshot of the page instead).
 - Attached text is sent to Groq's AI service, so do not upload customer data or confidential bank documents.
 

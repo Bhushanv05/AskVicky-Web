@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import threading
@@ -5,6 +6,7 @@ import time
 import datetime as dt
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from attachments import (
     SUPPORTED_TYPES,
@@ -31,6 +33,8 @@ MAX_MSGS_PER_SESSION = 40      # per browser session
 GLOBAL_DAILY_CAP = 500         # across all visitors, resets daily (UTC)
 HISTORY_WINDOW = 20            # last N messages sent to the model
 MAX_RECENTS = 20
+STORE_KEY = "askvicky_history_v1"   # name of the entry in the browser's local storage
+MAX_STORE_CHARS = 1_000_000    # browsers allow ~5 MB; stay well under it
 MAX_FILES_PER_SESSION = 10     # attachments are token-heavy, so capped separately
 ATTACH_SLOT_COST = 3           # a message with files uses 3 of the daily slots
 MAX_IMAGES_PER_SESSION = 5     # images are the most token-heavy attachment
@@ -165,7 +169,11 @@ def friendly_error(exc, vision=False):
 ss = st.session_state
 ss.setdefault("messages", [])
 ss.setdefault("chat_id", f"c_{dt.datetime.now().timestamp()}")
-ss.setdefault("recents", [])      # kept for this browser session only
+ss.setdefault("recents", [])      # saved to this browser's local storage (text only)
+ss.setdefault("history_loaded", False)
+ss.setdefault("dirty", False)
+ss.setdefault("write_nonce", 0)
+ss.setdefault("storage_ok", True)
 ss.setdefault("sent", 0)
 ss.setdefault("files_sent", 0)
 ss.setdefault("images_sent", 0)
@@ -185,6 +193,7 @@ def upsert_recent():
     ss.recents = [r for r in ss.recents if r["id"] != ss.chat_id]
     ss.recents.insert(0, entry)
     ss.recents = ss.recents[:MAX_RECENTS]
+    ss.dirty = True
 
 
 def new_chat():
@@ -204,6 +213,7 @@ def open_chat(chat_id):
 
 def delete_chat(chat_id):
     ss.recents = [r for r in ss.recents if r["id"] != chat_id]
+    ss.dirty = True
     if chat_id == ss.chat_id:
         ss.messages = []
         ss.chat_id = f"c_{dt.datetime.now().timestamp()}"
@@ -211,6 +221,7 @@ def delete_chat(chat_id):
 
 def clear_all():
     ss.recents = []
+    ss.dirty = True
     ss.messages = []
     ss.chat_id = f"c_{dt.datetime.now().timestamp()}"
 
@@ -357,12 +368,101 @@ def generate_reply(api_key):
     return "Sorry, I could not get a response. Please try again."
 
 
+# ── SAVED HISTORY (this browser only) ─────────────────────────────────────────
+_BRIDGE = components.declare_component(
+    "ls_bridge", path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ls_bridge"))
+
+
+def storage_bridge(**kw):
+    return _BRIDGE(**kw)
+
+
+def serialize_recents(recents):
+    """Recent chats as JSON text for local storage. Text only: attached files' text and
+    images are not saved (too big, and the most sensitive part). Oldest chats are
+    dropped first if the result would be too large."""
+    chats = []
+    for r in recents[:MAX_RECENTS]:
+        msgs = []
+        for m in r["messages"]:
+            item = {"role": m["role"], "content": m["content"]}
+            if m.get("attachments"):
+                item["attachments"] = [
+                    {"name": a["name"], "truncated": bool(a.get("truncated")), "image": bool(a.get("image"))}
+                    for a in m["attachments"]]
+            msgs.append(item)
+        chats.append({"id": r["id"], "preview": r["preview"], "time": r["time"], "messages": msgs})
+    data = json.dumps(chats, ensure_ascii=False)
+    while len(data) > MAX_STORE_CHARS and len(chats) > 1:
+        chats.pop()
+        data = json.dumps(chats, ensure_ascii=False)
+    while len(data) > MAX_STORE_CHARS and chats and len(chats[0]["messages"]) > 2:
+        chats[0]["messages"] = chats[0]["messages"][2:]
+        data = json.dumps(chats, ensure_ascii=False)
+    return data
+
+
+def parse_stored(data):
+    """Chats read back from local storage. Treat as untrusted: anything malformed is skipped."""
+    try:
+        raw = json.loads(data)
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for c in raw[:MAX_RECENTS]:
+        if not isinstance(c, dict):
+            continue
+        cid, prev, tm, msgs = c.get("id"), c.get("preview"), c.get("time"), c.get("messages")
+        if not (isinstance(cid, str) and isinstance(prev, str) and isinstance(tm, str)
+                and isinstance(msgs, list)):
+            continue
+        clean = []
+        for m in msgs[:200]:
+            if not (isinstance(m, dict) and m.get("role") in ("user", "assistant")
+                    and isinstance(m.get("content"), str)):
+                continue
+            item = {"role": m["role"], "content": m["content"]}
+            atts = m.get("attachments")
+            if isinstance(atts, list):
+                item["attachments"] = [
+                    {"name": str(a.get("name", ""))[:200], "chars": 0, "truncated": bool(a.get("truncated")),
+                     **({"image": True} if a.get("image") else {})}
+                    for a in atts if isinstance(a, dict)]
+            clean.append(item)
+        if clean:
+            out.append({"id": cid[:80], "preview": prev[:80], "time": tm[:40], "messages": clean})
+    return out
+
+
+def sync_history():
+    """Load saved chats once per page load, and save whenever the list changed."""
+    payload = None
+    if ss.dirty and ss.history_loaded:
+        ss.write_nonce += 1
+        payload = serialize_recents(ss.recents)
+        ss.dirty = False
+    stored = storage_bridge(key="ls_bridge", store_key=STORE_KEY, read=not ss.history_loaded,
+                            write=payload, nonce=ss.write_nonce, default=None)
+    if stored and not ss.history_loaded:
+        ss.history_loaded = True
+        ss.storage_ok = bool(stored.get("ok", True))
+        saved = parse_stored(stored.get("data") or "[]")
+        mine = {r["id"] for r in ss.recents}
+        ss.recents = (ss.recents + [r for r in saved if r["id"] not in mine])[:MAX_RECENTS]
+
+
+sync_history()
+
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 st.markdown(
     """
     <style>
       .block-container { padding-top: 4rem; max-width: 720px; }
       #MainMenu, footer { visibility: hidden; }
+      [data-testid="stElementContainer"]:has(iframe[title*="ls_bridge"]) { position:absolute; width:0; height:0; overflow:hidden; margin:0; }
 
       .av-head { display:flex; align-items:center; justify-content:space-between;
                  padding-bottom:.6rem; border-bottom:1px solid rgba(255,255,255,.07); }
@@ -413,6 +513,11 @@ if not ss.messages:
     )
     _l, _mid, _r = st.columns([1, 2, 1])
     _mid.link_button("✉️  Open Email Writer", EMAIL_WRITER_URL, use_container_width=True)
+    if ss.recents:
+        _mid.caption("Continue where you left off")
+        for r in ss.recents[:3]:
+            _mid.button(f"💬 {r['preview']}", key=f"hero_open_{r['id']}", on_click=open_chat,
+                        args=(r["id"],), use_container_width=True)
     st.markdown(
         f'<div class="av-note">📎 Attach PDF, Word, Excel, CSV or text files, or a screenshot / '
         f"photo (PNG, JPG, WEBP) of an error or script. Up to {MAX_FILES_PER_MESSAGE} per message, "
@@ -510,7 +615,7 @@ with st.sidebar:
                            mime="text/markdown", use_container_width=True)
     st.markdown("#### Recent chats")
     if not ss.recents:
-        st.caption("No recent chats yet. They last until you close or refresh this page.")
+        st.caption("No recent chats yet. Chats are saved in this browser only.")
     for r in ss.recents:
         c1, c2 = st.columns([5, 1])
         c1.button(f"💬 {r['preview']}", key=f"open_{r['id']}", on_click=open_chat,
@@ -518,6 +623,11 @@ with st.sidebar:
         c2.button("✕", key=f"del_{r['id']}", on_click=delete_chat, args=(r["id"],))
     if ss.recents or ss.messages:
         st.button("🗑️ Clear all", on_click=clear_all, use_container_width=True)
+    if ss.recents:
+        st.caption("Chats are saved in this browser only (text only, not attached files). "
+                   "Anyone using this browser can see them. Use Clear all to remove them.")
+    if ss.history_loaded and not ss.storage_ok:
+        st.caption("⚠️ This browser is blocking saved history (private mode?). Chats won't be kept.")
     st.caption("📎 Attachments and photos are sent to Groq's AI service. Don't upload customer "
                "data or confidential bank documents. Photos can show more than you intend; "
                "location data is removed, but anything visible on screen is not.")

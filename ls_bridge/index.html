@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script>
+// Tiny Streamlit component: reads and writes this browser's localStorage for the app.
+// It has no UI and talks to nothing except the Streamlit page that embeds it.
+(function () {
+  var lastNonce = null;
+  var sentRead = false;
+
+  function post(type, extra) {
+    var msg = { isStreamlitMessage: true, type: type };
+    for (var k in extra) { msg[k] = extra[k]; }
+    window.parent.postMessage(msg, "*");
+  }
+
+  function getStore() {
+    try { return window.localStorage; } catch (e) { return null; }
+  }
+
+  window.addEventListener("message", function (ev) {
+    var d = ev.data;
+    if (!d || d.type !== "streamlit:render") { return; }
+    var a = d.args || {};
+    var store = getStore();
+
+    // Write once per nonce (Streamlit re-sends the same args on every rerun).
+    if (a.write !== null && a.write !== undefined && a.nonce !== lastNonce) {
+      lastNonce = a.nonce;
+      try { store.setItem(a.store_key, a.write); } catch (e) { /* full or blocked: ignore */ }
+    }
+
+    // Answer a read request once; the app then stops asking.
+    if (a.read && !sentRead) {
+      sentRead = true;
+      var data = null;
+      var ok = !!store;
+      try { data = store ? store.getItem(a.store_key) : null; } catch (e) { ok = false; }
+      post("streamlit:setComponentValue", { value: { loaded: true, ok: ok, data: data }, dataType: "json" });
+    }
+  });
+
+  post("streamlit:componentReady", { apiVersion: 1 });
+  post("streamlit:setFrameHeight", { height: 0 });
+})();
+</script>
+</body>
+</html>
