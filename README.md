@@ -1,6 +1,6 @@
 # AskVicky Web 🤖
 
-Browser version of the AskVicky Android app. Same system prompt, same quick prompts, built with Streamlit and Groq.
+Browser version of the AskVicky Android app. Same system prompt, built with Streamlit and Groq. Clean single-screen UI with a link to Vicky's Email Writer and file attachments.
 
 🌐 **Live app: https://askvicky-ai.streamlit.app/**
 
@@ -24,6 +24,8 @@ streamlit run app.py
 - 40 messages per browser session
 - 500 messages per day across all visitors (edit `GLOBAL_DAILY_CAP` in `app.py`)
 - Recent chats live only in the current browser session; use "Download this chat" to keep one
+- Attachments: PDF, Word, Excel, CSV or text files; up to 3 per message, 5 MB each, 10 per session. A message with files counts as 3 against the daily cap. Images and scanned PDFs are not supported (the model reads text only).
+- Attached text is sent to Groq's AI service, so do not upload customer data or confidential bank documents.
 
 ## Changing the model
 
